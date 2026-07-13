@@ -90,7 +90,7 @@
 
 <div id="screenLib">
   <div class="brand"><span class="glyph">◆</span><h1>Хроники</h1><span class="badge" id="netBadge">офлайн?</span></div>
-  <div class="sub">Автономная читалка. Сама собирает список глав и хранит их на устройстве.</div>
+  <div class="sub">Читалка глав, подготовленных скриптом <code>download_chapters.py</code>. Сама текст не качает и telegra.ph не парсит — только читает файлы из <code>chapters/</code>.</div>
 
   <div class="panel" data-step="Библиотека">
     <div class="stat-grid">
@@ -103,10 +103,9 @@
   </div>
 
   <div class="panel" data-step="Обновление">
-    <label>Начальная страница-том (обычно не нужно менять)</label>
-    <input type="text" id="startUrl" value="https://telegra.ph/5-tom-989-1060-04-29">
-    <button id="btnCrawl">1. Обновить список глав</button>
-    <button id="btnDownload" disabled>2. Скачать новые главы офлайн</button>
+    <div class="hint">Список и тексты глав берутся из <code>chapters/index.json</code> и <code>chapters/*.txt</code> — эти файлы создаёт <code>download_chapters.py</code>. Запусти скрипт, загрузи папку <code>chapters/</code> в этот репозиторий на GitHub — и жми «Обновить список глав».</div>
+    <button id="btnCrawl">Обновить список глав</button>
+    <button id="btnDownload" disabled>Скачать новые главы офлайн</button>
     <div class="bar"><i id="progBar"></i></div>
     <div class="hint" id="progText">Готово к работе.</div>
     <div class="log" id="log"></div>
@@ -183,13 +182,13 @@ async function dbAllNums(){
   });
 }
 
-// ---------- localStorage: индекс глав (номер->url) и прогресс ----------
+// ---------- localStorage: индекс глав (номер->{title,file}) и прогресс ----------
 function loadIndex(){ try{ return JSON.parse(localStorage.getItem('ss_index')||'{}'); }catch(e){ return {}; } }
 function saveIndex(idx){ localStorage.setItem('ss_index', JSON.stringify(idx)); }
 function loadProgress(){ try{ return JSON.parse(localStorage.getItem('ss_progress')||'{}'); }catch(e){ return {}; } }
 function saveProgress(p){ localStorage.setItem('ss_progress', JSON.stringify(p)); }
 
-let chapterIndex = loadIndex();     // {num: url}
+let chapterIndex = loadIndex();     // {num: {title, file}}
 let progress = loadProgress();      // {read:[...], lastNum}
 let readSet = new Set(progress.read || []);
 let savedNums = new Set();          // числа, скачанные в IndexedDB
@@ -228,39 +227,26 @@ updateNetBadge();
 window.addEventListener('online', updateNetBadge);
 window.addEventListener('offline', updateNetBadge);
 
-// ---------- Telegraph API ----------
-function pathFromUrl(url){
-  try{ return new URL(url).pathname.replace(/^\//,''); }
-  catch(e){ return url.replace(/^https?:\/\/telegra\.ph\//,''); }
+// ---------- Статические данные: chapters/index.json + chapters/*.txt ----------
+// Эти файлы готовит download_chapters.py. Читалка их только читает — никакого
+// парсинга telegra.ph здесь нет и быть не должно.
+async function fetchIndex(bust){
+  const url = 'chapters/index.json' + (bust ? ('?t=' + Date.now()) : '');
+  const res = await fetch(url, bust ? {cache:'reload'} : {});
+  if(!res.ok) throw new Error(`HTTP ${res.status} — файл chapters/index.json не найден. Загрузил(а) папку chapters/ в репозиторий?`);
+  const entries = await res.json(); // [{num, title, file}, ...]
+  const idx = {};
+  entries.forEach(e => { idx[e.num] = {title: e.title, file: e.file}; });
+  return idx;
 }
-async function fetchTelegraphPage(pathOrUrl){
-  const res = await fetch(`https://api.telegra.ph/getPage/${pathFromUrl(pathOrUrl)}?return_content=true`);
-  const data = await res.json();
-  if(!data.ok) throw new Error('Telegraph API error');
-  return data.result;
-}
-function findLinks(node, out){
-  if(Array.isArray(node)){ node.forEach(n=>findLinks(n,out)); return out; }
-  if(node && typeof node==='object'){
-    if(node.tag==='a'){
-      const href = node.attrs && node.attrs.href;
-      const text = (node.children||[]).filter(c=>typeof c==='string').join('');
-      out.push({href, text});
-    }
-    (node.children||[]).forEach(c=>findLinks(c,out));
-  }
-  return out;
-}
-function nodeToText(node){
-  if(typeof node==='string') return node;
-  if(Array.isArray(node)) return node.map(nodeToText).join('');
-  if(node && typeof node==='object'){
-    const inner = (node.children||[]).map(nodeToText).join('');
-    if(node.tag==='p') return inner + '\n\n';
-    if(node.tag==='br') return '\n';
-    return inner;
-  }
-  return '';
+async function fetchChapterFile(entry){
+  const res = await fetch('chapters/' + entry.file);
+  if(!res.ok) throw new Error(`HTTP ${res.status}`);
+  const raw = await res.text();
+  const sep = raw.indexOf('\n\n');
+  const title = (sep === -1 ? raw : raw.slice(0, sep)).trim() || entry.title;
+  const body = (sep === -1 ? '' : raw.slice(sep+2)).trim();
+  return {title, body};
 }
 function log(msg, cls){
   const d = document.createElement('div');
@@ -270,42 +256,39 @@ function log(msg, cls){
   $('log').scrollTop = $('log').scrollHeight;
 }
 
-// ---------- Шаг 1: обновить список глав ----------
+// ---------- Обновить список глав (перечитать chapters/index.json) ----------
 $('btnCrawl').addEventListener('click', async () => {
   $('log').innerHTML = '';
   $('btnCrawl').disabled = true;
-  let currentUrl = $('startUrl').value.trim();
-  const seenVolumes = new Set();
-  let volCount = 0;
-
   try{
-    while(currentUrl && !seenVolumes.has(currentUrl)){
-      seenVolumes.add(currentUrl);
-      const result = await fetchTelegraphPage(currentUrl);
-      const links = findLinks(result.content, []);
-      let nextVolume = null;
-      links.forEach(({href, text}) => {
-        const m = text.match(/Глава\s+(\d+)/);
-        if(m) chapterIndex[parseInt(m[1],10)] = href;
-        else if(/Следующий\s+том/i.test(text)) nextVolume = href;
-      });
-      volCount++;
-      log(`Том ${volCount}: ${links.length} ссылок обработано`, 'ok');
-      currentUrl = nextVolume;
-      await new Promise(r=>setTimeout(r,150));
-    }
+    chapterIndex = await fetchIndex(true);
     saveIndex(chapterIndex);
     refreshOrdered();
     updateLibStats();
+    renderChapterList($('chFilter').value);
     log(`Готово. Всего известно глав: ${orderedNums.length}`, 'info');
   }catch(e){
-    log(`Ошибка: ${e.name}: ${e.message}`, 'err');
+    log(`Ошибка: ${e.message}`, 'err');
   }finally{
     $('btnCrawl').disabled = false;
   }
 });
 
-// ---------- Шаг 2: скачать новые главы офлайн ----------
+// подтягиваем список глав в фоне при старте (не критично, если офлайн —
+// тогда просто останется то, что уже было сохранено в localStorage раньше)
+(async () => {
+  try{
+    const idx = await fetchIndex(false);
+    if(Object.keys(idx).length){
+      chapterIndex = idx;
+      saveIndex(chapterIndex);
+      refreshOrdered();
+      updateLibStats();
+    }
+  }catch(e){ /* chapters/index.json ещё не выложен или нет сети — не страшно */ }
+})();
+
+// ---------- Скачать новые главы офлайн (из chapters/*.txt в IndexedDB) ----------
 $('btnDownload').addEventListener('click', async () => {
   const toFetch = orderedNums.filter(n => !savedNums.has(n));
   if(toFetch.length === 0){ log('Все известные главы уже скачаны.', 'info'); return; }
@@ -314,9 +297,8 @@ $('btnDownload').addEventListener('click', async () => {
   let done = 0;
   for(const num of toFetch){
     try{
-      const result = await fetchTelegraphPage(chapterIndex[num]);
-      const text = nodeToText(result.content).trim();
-      await dbPut({num, title: result.title, body: text});
+      const {title, body} = await fetchChapterFile(chapterIndex[num]);
+      await dbPut({num, title, body});
       savedNums.add(num);
       log(`Глава ${num}: сохранена офлайн`, 'ok');
     }catch(e){
@@ -326,7 +308,6 @@ $('btnDownload').addEventListener('click', async () => {
     $('progBar').style.width = Math.round(done/toFetch.length*100)+'%';
     $('progText').textContent = `${done} / ${toFetch.length}`;
     updateLibStats();
-    await new Promise(r=>setTimeout(r,250));
   }
   $('btnDownload').disabled = false;
   log('Загрузка завершена.', 'info');
@@ -393,7 +374,8 @@ function renderChapterList(filter){
     const row = document.createElement('div');
     row.className = 'chRow' + (i===currentIndex ? ' current' : '');
     const mark = savedNums.has(num) ? (readSet.has(num) ? '●' : '◐') : '○';
-    row.innerHTML = `<span class="mark">${mark}</span><span class="num">${num}</span><span class="ttl"></span>`;
+    const title = (chapterIndex[num] && chapterIndex[num].title) || '';
+    row.innerHTML = `<span class="mark">${mark}</span><span class="num">${num}</span><span class="ttl">${escapeHtml(title)}</span>`;
     row.addEventListener('click', async () => {
       await openChapterByIndex(i);
       $('drawer').classList.add('hidden');
