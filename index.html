@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, viewport-fit=cover">
+<title>Хроники</title>
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#0a0c0f">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-192.png">
+<style>
+  :root{
+    --bg:#0a0c0f; --panel:#12151a; --panel-2:#0e1114; --line:#23282f;
+    --text:#dcded8; --dim:#7d8790; --accent:#59e0a6; --accent-dim:#2b5c47;
+    --warn:#e0a659; --err:#e0596b;
+    --mono:"JetBrains Mono","SFMono-Regular",Consolas,Menlo,monospace;
+    --serif:Georgia,"Noto Serif","PT Serif",serif;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;padding:0;height:100%;}
+  body{ background:radial-gradient(ellipse at top,#131820 0%,var(--bg) 55%); color:var(--text);
+        font-family:var(--mono); line-height:1.5; }
+  .hidden{ display:none !important; }
+
+  #screenLib{ max-width:640px; margin:0 auto; padding:18px 14px 60px; }
+  .brand{ display:flex; align-items:baseline; gap:10px; margin-bottom:4px; }
+  .brand .glyph{ color:var(--accent); font-size:20px; text-shadow:0 0 12px rgba(89,224,166,.55); }
+  .brand h1{ font-size:15px; letter-spacing:.14em; text-transform:uppercase; margin:0; font-weight:600; }
+  .sub{ color:var(--dim); font-size:12px; margin:2px 0 22px; }
+
+  .panel{ background:linear-gradient(180deg,var(--panel),var(--panel-2)); border:1px solid var(--line);
+          border-radius:3px; padding:16px; margin-bottom:14px; position:relative; }
+  .panel::before{ content:attr(data-step); position:absolute; top:-9px; left:12px; background:var(--bg);
+                   padding:0 6px; font-size:10px; letter-spacing:.14em; color:var(--accent); text-transform:uppercase; }
+
+  label{ display:block; font-size:11px; color:var(--dim); margin-bottom:6px; }
+  input[type=text]{ width:100%; background:#080a0d; border:1px solid var(--line); color:var(--text);
+        padding:10px; border-radius:2px; font-family:var(--mono); font-size:13px; }
+  .hint{ font-size:11px; color:var(--dim); margin-top:10px; }
+
+  button{ width:100%; margin-top:12px; background:transparent; color:var(--accent); border:1px solid var(--accent-dim);
+        padding:11px 12px; border-radius:2px; font-family:var(--mono); font-size:12.5px; letter-spacing:.08em;
+        text-transform:uppercase; cursor:pointer; }
+  button.secondary{ color:var(--dim); border-color:var(--line); }
+  button:disabled{ opacity:.35; }
+
+  .stat-grid{ display:flex; gap:10px; margin-top:14px; }
+  .stat{ flex:1; background:#080a0d; border:1px solid var(--line); border-radius:2px; padding:9px 10px; }
+  .stat .n{ font-size:17px; color:var(--accent); }
+  .stat .l{ font-size:10px; color:var(--dim); letter-spacing:.06em; text-transform:uppercase; margin-top:2px; }
+
+  .bar{ height:6px; background:#080a0d; border:1px solid var(--line); border-radius:2px; overflow:hidden; margin-top:12px; }
+  .bar > i{ display:block; height:100%; width:0%; background:linear-gradient(90deg,var(--accent-dim),var(--accent)); transition:width .2s; }
+  .log{ margin-top:10px; max-height:130px; overflow-y:auto; font-size:11px; color:var(--dim);
+        border-top:1px dashed var(--line); padding-top:8px; }
+  .log .ok{ color:var(--accent); } .log .err{ color:var(--err); } .log .info{ color:var(--warn); }
+
+  #screenReader{ display:flex; flex-direction:column; height:100vh; }
+  .topbar{ display:flex; align-items:center; gap:10px; padding:10px 12px; border-bottom:1px solid var(--line);
+        background:var(--panel-2); flex-shrink:0; }
+  .topbar button{ width:auto; margin:0; padding:7px 10px; font-size:11px; }
+  .topbar .title{ flex:1; font-size:11px; color:var(--dim); text-align:center; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .reading{ flex:1; overflow-y:auto; padding:20px 18px 100px; }
+  .reading h2{ font-family:var(--serif); font-size:19px; margin:0 0 18px; font-weight:600; }
+  .reading .body{ font-family:var(--serif); font-size:var(--fs,17px); color:#e9e7e0; }
+  .reading .body p{ margin:0 0 1.1em; }
+  .bottombar{ display:flex; gap:8px; padding:10px 12px; border-top:1px solid var(--line); background:var(--panel-2); flex-shrink:0; }
+  .bottombar button{ margin:0; } .bottombar .navbtn{ flex:1; }
+  .bottombar .midinfo{ flex:0 0 auto; display:flex; align-items:center; justify-content:center; font-size:11px; color:var(--dim); padding:0 10px; min-width:70px; }
+
+  #drawer{ position:fixed; inset:0; background:rgba(0,0,0,.6); z-index:20; }
+  #drawer .sheet{ position:absolute; right:0; top:0; bottom:0; width:82%; max-width:360px; background:var(--panel);
+        border-left:1px solid var(--line); display:flex; flex-direction:column; }
+  #drawer .sheetHead{ padding:12px; border-bottom:1px solid var(--line); display:flex; gap:8px; align-items:center; }
+  #drawer .sheetHead input{ flex:1; background:#080a0d; border:1px solid var(--line); color:var(--text);
+        padding:8px; border-radius:2px; font-family:var(--mono); font-size:12px; }
+  #drawer .sheetHead button{ width:auto; margin:0; padding:8px 10px; }
+  #chList{ flex:1; overflow-y:auto; }
+  .chRow{ display:flex; align-items:center; gap:10px; padding:10px 12px; border-bottom:1px solid #181c22; cursor:pointer; font-size:12.5px; }
+  .chRow .mark{ width:14px; flex-shrink:0; color:var(--accent); font-size:13px; }
+  .chRow .num{ color:var(--dim); flex-shrink:0; width:44px; }
+  .chRow .ttl{ overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .chRow.current{ background:rgba(89,224,166,.08); }
+  .fontctl{ display:flex; gap:6px; } .fontctl button{ width:34px; margin:0; padding:6px 0; }
+  .badge{ display:inline-block; font-size:10px; padding:2px 6px; border-radius:2px; border:1px solid var(--line); color:var(--dim); margin-left:6px; }
+  .badge.on{ color:var(--accent); border-color:var(--accent-dim); }
+</style>
+</head>
+<body>
+
+<div id="screenLib">
+  <div class="brand"><span class="glyph">◆</span><h1>Хроники</h1><span class="badge" id="netBadge">офлайн?</span></div>
+  <div class="sub">Автономная читалка. Сама собирает список глав и хранит их на устройстве.</div>
+
+  <div class="panel" data-step="Библиотека">
+    <div class="stat-grid">
+      <div class="stat"><div class="n" id="statTotal">0</div><div class="l">глав известно</div></div>
+      <div class="stat"><div class="n" id="statSaved">0</div><div class="l">скачано офлайн</div></div>
+      <div class="stat"><div class="n" id="statRead">0</div><div class="l">прочитано</div></div>
+    </div>
+    <button id="btnContinue" disabled>Продолжить чтение</button>
+    <button id="btnBrowse" class="secondary" disabled>Список глав</button>
+  </div>
+
+  <div class="panel" data-step="Обновление">
+    <label>Начальная страница-том (обычно не нужно менять)</label>
+    <input type="text" id="startUrl" value="https://telegra.ph/5-tom-989-1060-04-29">
+    <button id="btnCrawl">1. Обновить список глав</button>
+    <button id="btnDownload" disabled>2. Скачать новые главы офлайн</button>
+    <div class="bar"><i id="progBar"></i></div>
+    <div class="hint" id="progText">Готово к работе.</div>
+    <div class="log" id="log"></div>
+  </div>
+</div>
+
+<div id="screenReader" class="hidden">
+  <div class="topbar">
+    <button class="secondary" id="btnMenu">☰</button>
+    <div class="title" id="topTitle">—</div>
+    <button class="secondary" id="btnLib">Библиотека</button>
+    <div class="fontctl"><button id="fontMinus">A-</button><button id="fontPlus">A+</button></div>
+  </div>
+  <div class="reading" id="readingArea">
+    <h2 id="chTitle">—</h2>
+    <div class="body" id="chBody"></div>
+  </div>
+  <div class="bottombar">
+    <button class="navbtn" id="btnPrev">‹ Пред.</button>
+    <div class="midinfo" id="midInfo">0 / 0</div>
+    <button class="navbtn" id="btnNext">След. ›</button>
+  </div>
+</div>
+
+<div id="drawer" class="hidden">
+  <div class="sheet">
+    <div class="sheetHead">
+      <input type="text" id="chFilter" placeholder="Номер главы...">
+      <button class="secondary" id="btnCloseDrawer">✕</button>
+    </div>
+    <div id="chList"></div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+
+// ---------- IndexedDB: хранит текст скачанных глав офлайн ----------
+let dbPromise = new Promise((resolve, reject) => {
+  const req = indexedDB.open('shadowSlaveDB', 1);
+  req.onupgradeneeded = () => {
+    const db = req.result;
+    if(!db.objectStoreNames.contains('chapters')) db.createObjectStore('chapters', {keyPath:'num'});
+  };
+  req.onsuccess = () => resolve(req.result);
+  req.onerror = () => reject(req.error);
+});
+
+async function dbPut(chapter){
+  const db = await dbPromise;
+  return new Promise((res, rej) => {
+    const tx = db.transaction('chapters','readwrite');
+    tx.objectStore('chapters').put(chapter);
+    tx.oncomplete = () => res();
+    tx.onerror = () => rej(tx.error);
+  });
+}
+async function dbGet(num){
+  const db = await dbPromise;
+  return new Promise((res, rej) => {
+    const tx = db.transaction('chapters','readonly');
+    const r = tx.objectStore('chapters').get(num);
+    r.onsuccess = () => res(r.result || null);
+    r.onerror = () => rej(r.error);
+  });
+}
+async function dbAllNums(){
+  const db = await dbPromise;
+  return new Promise((res, rej) => {
+    const tx = db.transaction('chapters','readonly');
+    const r = tx.objectStore('chapters').getAllKeys();
+    r.onsuccess = () => res(r.result || []);
+    r.onerror = () => rej(r.error);
+  });
+}
+
+// ---------- localStorage: индекс глав (номер->url) и прогресс ----------
+function loadIndex(){ try{ return JSON.parse(localStorage.getItem('ss_index')||'{}'); }catch(e){ return {}; } }
+function saveIndex(idx){ localStorage.setItem('ss_index', JSON.stringify(idx)); }
+function loadProgress(){ try{ return JSON.parse(localStorage.getItem('ss_progress')||'{}'); }catch(e){ return {}; } }
+function saveProgress(p){ localStorage.setItem('ss_progress', JSON.stringify(p)); }
+
+let chapterIndex = loadIndex();     // {num: url}
+let progress = loadProgress();      // {read:[...], lastNum}
+let readSet = new Set(progress.read || []);
+let savedNums = new Set();          // числа, скачанные в IndexedDB
+let orderedNums = [];               // отсортированный список ключей chapterIndex
+let currentIndex = -1;
+let fontSize = 17;
+
+function refreshOrdered(){
+  orderedNums = Object.keys(chapterIndex).map(Number).sort((a,b)=>a-b);
+}
+refreshOrdered();
+
+function updateLibStats(){
+  $('statTotal').textContent = orderedNums.length;
+  $('statSaved').textContent = savedNums.size;
+  $('statRead').textContent = readSet.size;
+  $('btnDownload').disabled = orderedNums.length === 0;
+  $('btnContinue').disabled = savedNums.size === 0;
+  $('btnBrowse').disabled = orderedNums.length === 0;
+}
+
+async function refreshSavedNums(){
+  const nums = await dbAllNums();
+  savedNums = new Set(nums);
+  updateLibStats();
+}
+refreshSavedNums();
+updateLibStats();
+
+function updateNetBadge(){
+  const b = $('netBadge');
+  b.textContent = navigator.onLine ? 'онлайн' : 'офлайн';
+  b.classList.toggle('on', navigator.onLine);
+}
+updateNetBadge();
+window.addEventListener('online', updateNetBadge);
+window.addEventListener('offline', updateNetBadge);
+
+// ---------- Telegraph API ----------
+function pathFromUrl(url){
+  try{ return new URL(url).pathname.replace(/^\//,''); }
+  catch(e){ return url.replace(/^https?:\/\/telegra\.ph\//,''); }
+}
+async function fetchTelegraphPage(pathOrUrl){
+  const res = await fetch(`https://api.telegra.ph/getPage/${pathFromUrl(pathOrUrl)}?return_content=true`);
+  const data = await res.json();
+  if(!data.ok) throw new Error('Telegraph API error');
+  return data.result;
+}
+function findLinks(node, out){
+  if(Array.isArray(node)){ node.forEach(n=>findLinks(n,out)); return out; }
+  if(node && typeof node==='object'){
+    if(node.tag==='a'){
+      const href = node.attrs && node.attrs.href;
+      const text = (node.children||[]).filter(c=>typeof c==='string').join('');
+      out.push({href, text});
+    }
+    (node.children||[]).forEach(c=>findLinks(c,out));
+  }
+  return out;
+}
+function nodeToText(node){
+  if(typeof node==='string') return node;
+  if(Array.isArray(node)) return node.map(nodeToText).join('');
+  if(node && typeof node==='object'){
+    const inner = (node.children||[]).map(nodeToText).join('');
+    if(node.tag==='p') return inner + '\n\n';
+    if(node.tag==='br') return '\n';
+    return inner;
+  }
+  return '';
+}
+function log(msg, cls){
+  const d = document.createElement('div');
+  if(cls) d.className = cls;
+  d.textContent = msg;
+  $('log').appendChild(d);
+  $('log').scrollTop = $('log').scrollHeight;
+}
+
+// ---------- Шаг 1: обновить список глав ----------
+$('btnCrawl').addEventListener('click', async () => {
+  $('log').innerHTML = '';
+  $('btnCrawl').disabled = true;
+  let currentUrl = $('startUrl').value.trim();
+  const seenVolumes = new Set();
+  let volCount = 0;
+
+  try{
+    while(currentUrl && !seenVolumes.has(currentUrl)){
+      seenVolumes.add(currentUrl);
+      const result = await fetchTelegraphPage(currentUrl);
+      const links = findLinks(result.content, []);
+      let nextVolume = null;
+      links.forEach(({href, text}) => {
+        const m = text.match(/Глава\s+(\d+)/);
+        if(m) chapterIndex[parseInt(m[1],10)] = href;
+        else if(/Следующий\s+том/i.test(text)) nextVolume = href;
+      });
+      volCount++;
+      log(`Том ${volCount}: ${links.length} ссылок обработано`, 'ok');
+      currentUrl = nextVolume;
+      await new Promise(r=>setTimeout(r,150));
+    }
+    saveIndex(chapterIndex);
+    refreshOrdered();
+    updateLibStats();
+    log(`Готово. Всего известно глав: ${orderedNums.length}`, 'info');
+  }catch(e){
+    log(`Ошибка: ${e.name}: ${e.message}`, 'err');
+  }finally{
+    $('btnCrawl').disabled = false;
+  }
+});
+
+// ---------- Шаг 2: скачать новые главы офлайн ----------
+$('btnDownload').addEventListener('click', async () => {
+  const toFetch = orderedNums.filter(n => !savedNums.has(n));
+  if(toFetch.length === 0){ log('Все известные главы уже скачаны.', 'info'); return; }
+
+  $('btnDownload').disabled = true;
+  let done = 0;
+  for(const num of toFetch){
+    try{
+      const result = await fetchTelegraphPage(chapterIndex[num]);
+      const text = nodeToText(result.content).trim();
+      await dbPut({num, title: result.title, body: text});
+      savedNums.add(num);
+      log(`Глава ${num}: сохранена офлайн`, 'ok');
+    }catch(e){
+      log(`Глава ${num}: ошибка (${e.message})`, 'err');
+    }
+    done++;
+    $('progBar').style.width = Math.round(done/toFetch.length*100)+'%';
+    $('progText').textContent = `${done} / ${toFetch.length}`;
+    updateLibStats();
+    await new Promise(r=>setTimeout(r,250));
+  }
+  $('btnDownload').disabled = false;
+  log('Загрузка завершена.', 'info');
+});
+
+// ---------- Экран чтения ----------
+function escapeHtml(s){ const d=document.createElement('div'); d.textContent=s; return d.innerHTML; }
+
+async function openChapterByNum(num){
+  const idx = orderedNums.indexOf(num);
+  if(idx === -1) return;
+  await openChapterByIndex(idx);
+}
+
+async function openChapterByIndex(idx){
+  if(idx < 0 || idx >= orderedNums.length) return;
+  const num = orderedNums[idx];
+  const saved = await dbGet(num);
+  if(!saved){
+    alert(`Глава ${num} ещё не скачана офлайн. Скачай её через "Скачать новые главы" (нужен интернет).`);
+    return;
+  }
+  currentIndex = idx;
+  $('chTitle').textContent = saved.title;
+  $('chBody').innerHTML = saved.body.split('\n\n').map(p=>`<p>${escapeHtml(p)}</p>`).join('');
+  $('topTitle').textContent = `Глава ${num}`;
+  $('midInfo').textContent = `${idx+1} / ${orderedNums.length}`;
+  $('btnPrev').disabled = idx===0;
+  $('btnNext').disabled = idx===orderedNums.length-1;
+  readSet.add(num);
+  progress.read = [...readSet];
+  progress.lastNum = num;
+  saveProgress(progress);
+  $('readingArea').scrollTop = 0;
+  updateLibStats();
+
+  $('screenLib').classList.add('hidden');
+  $('screenReader').classList.remove('hidden');
+}
+
+$('btnContinue').addEventListener('click', () => {
+  const startNum = progress.lastNum && orderedNums.includes(progress.lastNum)
+    ? progress.lastNum
+    : [...savedNums].sort((a,b)=>a-b)[0];
+  if(startNum != null) openChapterByNum(startNum);
+});
+$('btnLib').addEventListener('click', () => {
+  $('screenReader').classList.add('hidden');
+  $('screenLib').classList.remove('hidden');
+  updateLibStats();
+});
+$('btnPrev').addEventListener('click', () => openChapterByIndex(currentIndex-1));
+$('btnNext').addEventListener('click', () => openChapterByIndex(currentIndex+1));
+$('fontPlus').addEventListener('click', () => { fontSize=Math.min(fontSize+1,26); $('readingArea').style.setProperty('--fs',fontSize+'px'); });
+$('fontMinus').addEventListener('click', () => { fontSize=Math.max(fontSize-1,13); $('readingArea').style.setProperty('--fs',fontSize+'px'); });
+
+// ---------- Список глав ----------
+function renderChapterList(filter){
+  const list = $('chList');
+  list.innerHTML = '';
+  const q = (filter||'').trim();
+  orderedNums.forEach((num, i) => {
+    if(q && !String(num).includes(q)) return;
+    const row = document.createElement('div');
+    row.className = 'chRow' + (i===currentIndex ? ' current' : '');
+    const mark = savedNums.has(num) ? (readSet.has(num) ? '●' : '◐') : '○';
+    row.innerHTML = `<span class="mark">${mark}</span><span class="num">${num}</span><span class="ttl"></span>`;
+    row.addEventListener('click', async () => {
+      await openChapterByIndex(i);
+      $('drawer').classList.add('hidden');
+    });
+    list.appendChild(row);
+  });
+}
+$('btnMenu').addEventListener('click', () => { $('drawer').classList.remove('hidden'); renderChapterList($('chFilter').value); });
+$('btnBrowse').addEventListener('click', () => { $('drawer').classList.remove('hidden'); renderChapterList($('chFilter').value); });
+$('btnCloseDrawer').addEventListener('click', () => $('drawer').classList.add('hidden'));
+$('chFilter').addEventListener('input', () => renderChapterList($('chFilter').value));
+
+// ---------- Service worker (офлайн-доступ к оболочке) ----------
+if('serviceWorker' in navigator){
+  window.addEventListener('load', () => navigator.serviceWorker.register('sw.js').catch(()=>{}));
+}
+</script>
+</body>
+</html>
