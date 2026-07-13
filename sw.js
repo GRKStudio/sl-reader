@@ -1,4 +1,4 @@
-const CACHE_NAME = 'shadowslave-shell-v1';
+const CACHE_NAME = 'shadowslave-shell-v2';
 const SHELL_FILES = [
   './',
   './index.html',
@@ -23,22 +23,20 @@ self.addEventListener('activate', (event) => {
   self.clients.claim();
 });
 
-// Оболочку приложения (HTML/CSS/JS/иконки) отдаём офлайн из кэша.
-// Запросы к api.telegra.ph НЕ трогаем — они всегда идут напрямую в сеть,
-// когда сети нет, они просто упадут с ошибкой, и приложение покажет,
-// что доступны только уже скачанные (сохранённые в IndexedDB) главы.
+// Сеть всегда в приоритете (чтобы новые главы/обновления читалки были видны
+// сразу после деплоя, без ручного сброса кэша), кэш — только запасной вариант
+// на случай офлайна. Раньше было наоборот (кэш-первым), из-за чего страница
+// навсегда застревала на той версии, что закэшировалась при самом первом
+// открытии сайта.
 self.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url);
-  if (url.origin !== self.location.origin) return; // не кэшируем внешние API
+  if (url.origin !== self.location.origin) return; // не трогаем внешние запросы
 
   event.respondWith(
-    caches.match(event.request).then((cached) => {
-      if (cached) return cached;
-      return fetch(event.request).then((res) => {
-        const resClone = res.clone();
-        caches.open(CACHE_NAME).then((cache) => cache.put(event.request, resClone));
-        return res;
-      }).catch(() => cached);
-    })
+    fetch(event.request).then((res) => {
+      const resClone = res.clone();
+      caches.open(CACHE_NAME).then((cache) => cache.put(event.request, resClone));
+      return res;
+    }).catch(() => caches.match(event.request))
   );
 });
