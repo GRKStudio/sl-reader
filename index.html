@@ -55,22 +55,33 @@
         border-top:1px dashed var(--line); padding-top:8px; }
   .log .ok{ color:var(--accent); } .log .err{ color:var(--err); } .log .info{ color:var(--warn); }
 
-  #screenReader{ display:flex; flex-direction:column; height:100vh; }
+  #screenReader{ display:flex; flex-direction:column; height:100vh; position:relative; }
+  #screenLib, #screenReader{ animation-fill-mode:both; }
+  @keyframes screenIn{ from{ opacity:0; transform:translateY(10px);} to{ opacity:1; transform:translateY(0);} }
+  #screenLib.enter, #screenReader.enter{ animation:screenIn .32s ease; }
   .topbar{ display:flex; align-items:center; gap:10px; padding:10px 12px; border-bottom:1px solid var(--line);
-        background:var(--panel-2); flex-shrink:0; }
+        background:var(--panel-2); flex-shrink:0; position:absolute; top:0; left:0; right:0; z-index:5;
+        box-shadow:0 6px 16px rgba(0,0,0,.35); transition:transform .28s ease, opacity .28s ease; }
+  .topbar.hide{ transform:translateY(-100%); opacity:0; pointer-events:none; }
   .topbar button{ width:auto; margin:0; padding:7px 10px; font-size:11px; }
   .topbar .title{ flex:1; font-size:11px; color:var(--dim); text-align:center; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .reading{ flex:1; overflow-y:auto; padding:20px 18px 100px; }
+  .reading{ flex:1; overflow-y:auto; padding:64px 18px 100px; }
   .reading h2{ font-family:var(--serif); font-size:19px; margin:0 0 18px; font-weight:600; }
   .reading .body{ font-family:var(--serif); font-size:var(--fs,17px); color:#e9e7e0; }
   .reading .body p{ margin:0 0 1.1em; }
+  @keyframes chFadeIn{ from{ opacity:0; transform:translateY(8px);} to{ opacity:1; transform:translateY(0);} }
+  #chTitle.anim, #chBody.anim{ animation:chFadeIn .32s ease; }
   .bottombar{ display:flex; gap:8px; padding:10px 12px; border-top:1px solid var(--line); background:var(--panel-2); flex-shrink:0; }
   .bottombar button{ margin:0; } .bottombar .navbtn{ flex:1; }
   .bottombar .midinfo{ flex:0 0 auto; display:flex; align-items:center; justify-content:center; font-size:11px; color:var(--dim); padding:0 10px; min-width:70px; }
 
-  #drawer{ position:fixed; inset:0; background:rgba(0,0,0,.6); z-index:20; }
+  #drawer{ position:fixed; inset:0; background:rgba(0,0,0,.6); z-index:20;
+        opacity:0; pointer-events:none; transition:opacity .28s ease; }
+  #drawer.open{ opacity:1; pointer-events:auto; }
   #drawer .sheet{ position:absolute; right:0; top:0; bottom:0; width:82%; max-width:360px; background:var(--panel);
-        border-left:1px solid var(--line); display:flex; flex-direction:column; }
+        border-left:1px solid var(--line); display:flex; flex-direction:column;
+        transform:translateX(100%); transition:transform .3s ease; }
+  #drawer.open .sheet{ transform:translateX(0); }
   #drawer .sheetHead{ padding:12px; border-bottom:1px solid var(--line); display:flex; gap:8px; align-items:center; }
   #drawer .sheetHead input{ flex:1; background:#080a0d; border:1px solid var(--line); color:var(--text);
         padding:8px; border-radius:2px; font-family:var(--mono); font-size:12px; }
@@ -113,7 +124,7 @@
 </div>
 
 <div id="screenReader" class="hidden">
-  <div class="topbar">
+  <div class="topbar" id="topbar">
     <button class="secondary" id="btnMenu">☰</button>
     <div class="title" id="topTitle">—</div>
     <button class="secondary" id="btnLib">Библиотека</button>
@@ -130,7 +141,7 @@
   </div>
 </div>
 
-<div id="drawer" class="hidden">
+<div id="drawer">
   <div class="sheet">
     <div class="sheetHead">
       <input type="text" id="chFilter" placeholder="Номер главы...">
@@ -189,7 +200,8 @@ function loadProgress(){ try{ return JSON.parse(localStorage.getItem('ss_progres
 function saveProgress(p){ localStorage.setItem('ss_progress', JSON.stringify(p)); }
 
 let chapterIndex = loadIndex();     // {num: {title, file}}
-let progress = loadProgress();      // {read:[...], lastNum}
+let progress = loadProgress();      // {read:[...], lastNum, positions:{num:fraction}}
+progress.positions = progress.positions || {};
 let readSet = new Set(progress.read || []);
 let savedNums = new Set();          // числа, скачанные в IndexedDB
 let orderedNums = [];               // отсортированный список ключей chapterIndex
@@ -316,6 +328,67 @@ $('btnDownload').addEventListener('click', async () => {
 // ---------- Экран чтения ----------
 function escapeHtml(s){ const d=document.createElement('div'); d.textContent=s; return d.innerHTML; }
 
+function showScreen(el){
+  el.classList.remove('hidden');
+  el.classList.remove('enter');
+  void el.offsetWidth; // reflow, чтобы анимация перезапустилась
+  el.classList.add('enter');
+}
+
+function triggerContentAnim(){
+  const title = $('chTitle'), body = $('chBody');
+  title.classList.remove('anim'); body.classList.remove('anim');
+  void body.offsetWidth;
+  title.classList.add('anim'); body.classList.add('anim');
+}
+
+// ---------- Точная позиция чтения внутри главы (не только номер главы) ----------
+function currentScrollFraction(){
+  const el = $('readingArea');
+  const max = el.scrollHeight - el.clientHeight;
+  return max > 0 ? el.scrollTop / max : 0;
+}
+function saveCurrentPosition(){
+  if(currentIndex < 0) return;
+  const num = orderedNums[currentIndex];
+  if(num == null) return;
+  progress.positions[num] = currentScrollFraction();
+  saveProgress(progress);
+}
+document.addEventListener('visibilitychange', () => { if(document.hidden) saveCurrentPosition(); });
+window.addEventListener('beforeunload', saveCurrentPosition);
+
+// ---------- Автоскрытие верхней плашки при прокрутке ----------
+const topbarEl = $('topbar');
+let topbarHidden = false;
+let lastScrollTop = 0;
+function setTopbarHidden(hidden){
+  if(hidden === topbarHidden) return;
+  topbarHidden = hidden;
+  topbarEl.classList.toggle('hide', hidden);
+}
+let scrollSaveTimer = null;
+$('readingArea').addEventListener('scroll', () => {
+  const el = $('readingArea');
+  const st = el.scrollTop;
+  if(st < 32) setTopbarHidden(false);
+  else if(st - lastScrollTop > 6) setTopbarHidden(true);
+  else if(lastScrollTop - st > 6) setTopbarHidden(false);
+  lastScrollTop = st;
+
+  clearTimeout(scrollSaveTimer);
+  scrollSaveTimer = setTimeout(saveCurrentPosition, 200);
+}, {passive:true});
+
+// тап по тексту тоже переключает плашку — не только направление скролла
+let touchMoved = false;
+$('readingArea').addEventListener('touchmove', () => { touchMoved = true; }, {passive:true});
+$('readingArea').addEventListener('touchstart', () => { touchMoved = false; }, {passive:true});
+$('readingArea').addEventListener('click', () => {
+  if(touchMoved) return;
+  setTopbarHidden(!topbarHidden);
+});
+
 async function openChapterByNum(num){
   const idx = orderedNums.indexOf(num);
   if(idx === -1) return;
@@ -330,9 +403,15 @@ async function openChapterByIndex(idx){
     alert(`Глава ${num} ещё не скачана офлайн. Скачай её через "Скачать новые главы" (нужен интернет).`);
     return;
   }
+  const cameFromLib = $('screenReader').classList.contains('hidden');
+  // экран чтения скрыт (display:none) -> scrollTop читается как 0, сохранять нечего:
+  // позиция предыдущей главы уже сохранена по скроллу/уходу в библиотеку раньше
+  if(!cameFromLib) saveCurrentPosition();
+
   currentIndex = idx;
   $('chTitle').textContent = saved.title;
   $('chBody').innerHTML = saved.body.split('\n\n').map(p=>`<p>${escapeHtml(p)}</p>`).join('');
+  triggerContentAnim();
   $('topTitle').textContent = `Глава ${num}`;
   $('midInfo').textContent = `${idx+1} / ${orderedNums.length}`;
   $('btnPrev').disabled = idx===0;
@@ -341,11 +420,19 @@ async function openChapterByIndex(idx){
   progress.read = [...readSet];
   progress.lastNum = num;
   saveProgress(progress);
-  $('readingArea').scrollTop = 0;
   updateLibStats();
 
   $('screenLib').classList.add('hidden');
-  $('screenReader').classList.remove('hidden');
+  if(cameFromLib) showScreen($('screenReader'));
+
+  setTopbarHidden(false);
+  requestAnimationFrame(() => {
+    const el = $('readingArea');
+    const frac = progress.positions[num] || 0;
+    const max = el.scrollHeight - el.clientHeight;
+    el.scrollTop = max > 0 ? frac * max : 0;
+    lastScrollTop = el.scrollTop;
+  });
 }
 
 $('btnContinue').addEventListener('click', () => {
@@ -355,8 +442,9 @@ $('btnContinue').addEventListener('click', () => {
   if(startNum != null) openChapterByNum(startNum);
 });
 $('btnLib').addEventListener('click', () => {
+  saveCurrentPosition();
   $('screenReader').classList.add('hidden');
-  $('screenLib').classList.remove('hidden');
+  showScreen($('screenLib'));
   updateLibStats();
 });
 $('btnPrev').addEventListener('click', () => openChapterByIndex(currentIndex-1));
@@ -378,14 +466,14 @@ function renderChapterList(filter){
     row.innerHTML = `<span class="mark">${mark}</span><span class="num">${num}</span><span class="ttl">${escapeHtml(title)}</span>`;
     row.addEventListener('click', async () => {
       await openChapterByIndex(i);
-      $('drawer').classList.add('hidden');
+      $('drawer').classList.remove('open');
     });
     list.appendChild(row);
   });
 }
-$('btnMenu').addEventListener('click', () => { $('drawer').classList.remove('hidden'); renderChapterList($('chFilter').value); });
-$('btnBrowse').addEventListener('click', () => { $('drawer').classList.remove('hidden'); renderChapterList($('chFilter').value); });
-$('btnCloseDrawer').addEventListener('click', () => $('drawer').classList.add('hidden'));
+$('btnMenu').addEventListener('click', () => { $('drawer').classList.add('open'); renderChapterList($('chFilter').value); });
+$('btnBrowse').addEventListener('click', () => { $('drawer').classList.add('open'); renderChapterList($('chFilter').value); });
+$('btnCloseDrawer').addEventListener('click', () => $('drawer').classList.remove('open'));
 $('chFilter').addEventListener('input', () => renderChapterList($('chFilter').value));
 
 // ---------- Service worker (офлайн-доступ к оболочке) ----------
