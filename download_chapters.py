@@ -5,8 +5,11 @@
 1. Начинает со страницы тома (по умолчанию 5 том, откуда идёт чистый telegra.ph без Ranobelib)
 2. Собирает все ссылки "Глава N" на странице тома
 3. Идёт по ссылке "Следующий том" и повторяет, пока тома не закончатся
-4. Каждую главу скачивает через официальный API Telegraph (api.telegra.ph/getPage)
-5. Сохраняет каждую главу в отдельный .txt файл в папке chapters/
+4. После последней главы, найденной через тома (например, 1840), тома заканчиваются,
+   но у самих глав в конце текста есть ссылка "Следующая глава" — скрипт идёт по этим
+   ссылкам напрямую, пока они не закончатся
+5. Каждую главу скачивает через официальный API Telegraph (api.telegra.ph/getPage)
+6. Сохраняет каждую главу в отдельный .txt файл в папке chapters/
 
 Установка зависимостей:
     pip install requests beautifulsoup4
@@ -28,6 +31,7 @@ DELAY_BETWEEN_REQUESTS = 0.5  # секунды, чтобы не спамить A
 
 CHAPTER_LINK_RE = re.compile(r"Глава\s+(\d+)")
 NEXT_VOLUME_RE = re.compile(r"Следующий\s+том", re.IGNORECASE)
+NEXT_CHAPTER_LINK_TEXT_RE = re.compile(r"след", re.IGNORECASE)
 
 
 def get_html(url: str) -> str:
@@ -82,8 +86,8 @@ def node_to_text(node) -> str:
     return ""
 
 
-def download_chapter_text(chapter_url: str) -> tuple[str, str]:
-    """Возвращает (заголовок, текст_главы)"""
+def fetch_chapter_page(chapter_url: str) -> dict:
+    """Возвращает result из Telegraph API (getPage) для главы: title, content и т.д."""
     path = telegraph_path_from_url(chapter_url)
     api_url = f"https://api.telegra.ph/getPage/{path}?return_content=true"
     r = requests.get(api_url, timeout=20)
@@ -91,12 +95,81 @@ def download_chapter_text(chapter_url: str) -> tuple[str, str]:
     data = r.json()
     if not data.get("ok"):
         raise RuntimeError(f"Telegraph API error for {chapter_url}: {data}")
+    return data["result"]
 
-    result = data["result"]
-    title = result.get("title", path)
+
+def download_chapter_text(chapter_url: str) -> tuple[str, str]:
+    """Возвращает (заголовок, текст_главы)"""
+    result = fetch_chapter_page(chapter_url)
+    title = result.get("title", telegraph_path_from_url(chapter_url))
     content = result.get("content", [])
     text = node_to_text(content).strip()
     return title, text
+
+
+def find_links_in_content(content):
+    """Собирает все ссылки (текст, url) из content-нод Telegraph API"""
+    links = []
+
+    def walk(node):
+        if isinstance(node, dict):
+            if node.get("tag") == "a":
+                href = node.get("attrs", {}).get("href")
+                if href:
+                    if not href.startswith("http"):
+                        href = "https://telegra.ph" + href
+                    links.append((node_to_text(node.get("children", [])).strip(), href))
+            for child in node.get("children", []):
+                walk(child)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(content)
+    return links
+
+
+def find_next_chapter_url(content):
+    """Ищет в тексте главы ссылку "Следующая глава" и возвращает её url, если есть.
+
+    После ~1840 главы больше не входят в тома-оглавления: единственный способ
+    узнать про следующую главу — пройти по этой ссылке в конце текущей.
+    """
+    for text, href in find_links_in_content(content):
+        if NEXT_CHAPTER_LINK_TEXT_RE.search(text):
+            return href
+    return None
+
+
+def extend_chapters_via_next_links(all_chapters: dict):
+    """Продолжает all_chapters за пределы последнего тома, идя по ссылкам
+    "Следующая глава" внутри самих глав, пока такая ссылка находится."""
+    if not all_chapters:
+        return
+
+    num = max(all_chapters)
+    url = all_chapters[num]
+    seen_urls = {url}
+
+    while True:
+        try:
+            result = fetch_chapter_page(url)
+        except Exception as e:
+            print(f"  Глава {num}: не удалось прочитать для поиска следующей ссылки ({e})")
+            break
+
+        next_url = find_next_chapter_url(result.get("content", []))
+        if not next_url or next_url in seen_urls:
+            break
+        seen_urls.add(next_url)
+
+        num += 1
+        if num in all_chapters:
+            break
+        all_chapters[num] = next_url
+        print(f"    Найдена глава {num} по ссылке «Следующая глава»")
+        url = next_url
+        time.sleep(DELAY_BETWEEN_REQUESTS)
 
 
 def build_index():
@@ -142,6 +215,9 @@ def main():
             print(f"    Найдено {len(chapters)} глав. Следующий том: {next_volume_url}")
             volume_url = next_volume_url
             time.sleep(DELAY_BETWEEN_REQUESTS)
+
+        print("\nИщу главы после последнего тома по ссылкам «Следующая глава»...")
+        extend_chapters_via_next_links(all_chapters)
 
         print(f"\nВсего найдено глав: {len(all_chapters)}")
 
