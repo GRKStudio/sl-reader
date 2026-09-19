@@ -8,13 +8,19 @@
 4. Все главы, найденные через тома, скачивает параллельно (несколько потоков) —
    их url заранее известны, поэтому порядок скачивания не важен
 5. После последней главы, найденной через тома (например, 1840), тома заканчиваются,
-   но у самих глав в конце текста есть ссылка "Следующая глава". Такие главы скачивает
-   по одной, идя по этой ссылке: url следующей главы становится известен только со
-   страницы предыдущей, поэтому этот шаг принципиально последовательный и его нельзя
-   распараллелить — но каждая страница запрашивается только один раз (сразу и текст
-   сохраняется, и ищется ссылка на следующую), а не дважды, как раньше
-6. Каждую главу скачивает через официальный API Telegraph (api.telegra.ph/getPage)
-7. Сохраняет каждую главу в отдельный .txt файл в папке chapters/
+   но у самих глав в конце текста есть ссылка "Следующая глава". Url следующей главы
+   узнаётся только со страницы предыдущей, поэтому обход одной цепочки принципиально
+   последовательный и его нельзя распараллелить. Но если заранее известны url ещё
+   каких-то более поздних глав (см. CHAIN_CHECKPOINTS ниже), от каждой такой
+   контрольной точки запускается СВОЯ независимая цепочка, и все они идут
+   ПАРАЛЛЕЛЬНО, пока не упрутся в следующую контрольную точку или в конец истории.
+   Каждая страница при этом запрашивается только один раз (сразу и текст
+   сохраняется, и ищется ссылка на следующую).
+6. Прогресс каждой цепочки (до какой главы дошли) сохраняется в
+   chapters/chain_progress.json, поэтому при перезапуске скрипт не начинает
+   поиск заново, а продолжает с сохранённого места
+7. Каждую главу скачивает через официальный API Telegraph (api.telegra.ph/getPage)
+8. Сохраняет каждую главу в отдельный .txt файл в папке chapters/
 
 Установка зависимостей:
     pip install requests beautifulsoup4
@@ -34,8 +40,19 @@ from urllib.parse import urlparse
 
 START_VOLUME_URL = "https://telegra.ph/5-tom-989-1060-04-29"
 OUTPUT_DIR = Path("chapters")
+PROGRESS_FILE = OUTPUT_DIR / "chain_progress.json"
 MAX_WORKERS = 8  # потоков для скачивания уже известных глав (из томов)
 VOLUME_DELAY = 0.5  # секунды между чтением страниц томов (их всего десяток, не критично)
+
+# Главы после последнего тома известны только по цепочке "Следующая глава",
+# и это последовательный процесс. Чтобы не идти по одной длинной цепочке от
+# 1840 до самого конца истории, здесь можно перечислить url уже известных
+# более поздних глав — от каждой из них запустится своя параллельная цепочка.
+# Ключ — номер главы, значение — её url.
+CHAIN_CHECKPOINTS = {
+    2250: "https://telegra.ph/Glava-2250-Plamya-nadezhdy-04-03",
+    3000: "https://telegra.ph/Glava-3000-Vospominaniya-zabveniya-05-25",
+}
 
 CHAPTER_LINK_RE = re.compile(r"Глава\s+(\d+)")
 NEXT_VOLUME_RE = re.compile(r"Следующий\s+том", re.IGNORECASE)
@@ -191,28 +208,68 @@ def download_known_chapters(all_chapters: dict, max_workers: int = MAX_WORKERS):
             save_chapter(num, title, text)
 
 
-def follow_and_download_next_links(all_chapters: dict):
-    """Продолжает за пределы последнего тома, идя по ссылке "Следующая глава"
-    внутри самих глав, и сразу сохраняет каждую главу.
+def load_progress() -> dict:
+    """Читает сохранённый прогресс цепочек: до какой главы дошла каждая из них."""
+    if PROGRESS_FILE.exists():
+        try:
+            return json.loads(PROGRESS_FILE.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return {}
+    return {}
 
-    Url следующей главы узнаётся только со страницы текущей, поэтому это
-    принципиально последовательный процесс (его нельзя распараллелить, не зная
-    заранее url'ы) — но каждая страница запрашивается один раз, а не дважды:
-    из того же ответа API берётся и текст для сохранения, и ссылка на следующую.
+
+def build_chain_segments(all_chapters: dict) -> list[tuple[int, str, "int | None"]]:
+    """Строит список независимых отрезков цепочки "Следующая глава".
+
+    Каждый отрезок начинается в известной точке (последняя глава из томов или
+    одна из CHAIN_CHECKPOINTS) и обрывается ровно там, где начинается следующая
+    точка — эту главу скачает уже следующий отрезок, а не текущий, чтобы никакая
+    глава не считалась "скачанной" дважды и ни одна не пропускалась на стыке.
     """
-    if not all_chapters:
-        return
+    anchors: list[tuple[int, str]] = []
+    if all_chapters:
+        last_num = max(all_chapters)
+        anchors.append((last_num, all_chapters[last_num]))
+    for num, url in CHAIN_CHECKPOINTS.items():
+        if not anchors or num > anchors[0][0]:
+            anchors.append((num, url))
+    anchors.sort(key=lambda a: a[0])
 
-    num = max(all_chapters)
-    url = all_chapters[num]
+    segments = []
+    for i, (num, url) in enumerate(anchors):
+        stop_num = anchors[i + 1][0] if i + 1 < len(anchors) else None
+        segments.append((num, url, stop_num))
+    return segments
+
+
+def run_chain_segment(anchor_num: int, anchor_url: str, stop_num, progress: dict, progress_lock: threading.Lock):
+    """Идёт по ссылке "Следующая глава", начиная с anchor_num, и сразу сохраняет
+    каждую главу. Останавливается перед stop_num (её скачает соседний отрезок)
+    либо когда ссылка на следующую главу больше не находится.
+
+    Если в PROGRESS_FILE уже есть более поздняя позиция для этого же anchor_num
+    (с прошлого запуска), продолжает с неё, а не с самого начала отрезка —
+    так не приходится заново проходить уже пройденные главы после перезапуска.
+    """
+    key = str(anchor_num)
+    saved = progress.get(key)
+    if saved and saved.get("last_num", anchor_num) >= anchor_num:
+        num, url = saved["last_num"], saved["last_url"]
+        if stop_num is not None and num >= stop_num:
+            return num, 0  # этот отрезок уже был пройден целиком в прошлый раз
+        print(f"  [{anchor_num}] продолжаю с сохранённой позиции: глава {num}")
+    else:
+        num, url = anchor_num, anchor_url
+
     seen_urls = {url}
     found = 0
+    last_processed_num = None  # последняя глава, которую этот отрезок реально скачал
 
     while True:
         try:
             result = fetch_chapter_page(url)
         except Exception as e:
-            print(f"  Глава {num}: не удалось прочитать ({e})")
+            print(f"  [{anchor_num}] глава {num}: не удалось прочитать ({e})")
             break
 
         out_path = OUTPUT_DIR / f"{num:05d}.txt"
@@ -220,6 +277,11 @@ def follow_and_download_next_links(all_chapters: dict):
             title = result.get("title", telegraph_path_from_url(url))
             text = node_to_text(result.get("content", [])).strip()
             save_chapter(num, title, text)
+        last_processed_num = num
+
+        with progress_lock:
+            progress[key] = {"last_num": num, "last_url": url}
+            PROGRESS_FILE.write_text(json.dumps(progress, ensure_ascii=False, indent=2), encoding="utf-8")
 
         next_url = find_next_chapter_url(result.get("content", []))
         if not next_url or next_url in seen_urls:
@@ -227,14 +289,39 @@ def follow_and_download_next_links(all_chapters: dict):
         seen_urls.add(next_url)
 
         num += 1
-        if num in all_chapters:
-            break
-        all_chapters[num] = next_url
+        if stop_num is not None and num >= stop_num:
+            break  # эту и дальнейшие главы скачает отрезок, начинающийся в stop_num
         found += 1
         url = next_url
 
-    if found:
-        print(f"  Найдено и скачано ещё {found} глав(ы) по ссылке «Следующая глава»")
+    return (last_processed_num if last_processed_num is not None else num), found
+
+
+def run_chain_segments(all_chapters: dict):
+    """Запускает все отрезки цепочки "Следующая глава" параллельно, каждый в
+    своём потоке — они независимы (используют разные url), поэтому в отличие
+    от обхода одной цепочки это можно безопасно распараллелить."""
+    segments = build_chain_segments(all_chapters)
+    if not segments:
+        return
+
+    progress = load_progress()
+    progress_lock = threading.Lock()
+
+    print(f"  Запускаю {len(segments)} параллельных цепочек «Следующая глава»...")
+    with ThreadPoolExecutor(max_workers=len(segments)) as executor:
+        futures = {
+            executor.submit(run_chain_segment, num, url, stop_num, progress, progress_lock): num
+            for num, url, stop_num in segments
+        }
+        for future in as_completed(futures):
+            anchor_num = futures[future]
+            try:
+                last_num, found = future.result()
+            except Exception as e:
+                print(f"  [{anchor_num}] цепочка прервалась с ошибкой: {e}")
+                continue
+            print(f"  [{anchor_num}] цепочка дошла до главы {last_num} (+{found} новых)")
 
 
 def build_index():
@@ -287,7 +374,7 @@ def main():
         download_known_chapters(all_chapters)
 
         print("\nИщу и скачиваю главы после последнего тома по ссылке «Следующая глава»...")
-        follow_and_download_next_links(all_chapters)
+        run_chain_segments(all_chapters)
 
         print("\nГотово. Файлы лежат в папке chapters/")
     finally:
