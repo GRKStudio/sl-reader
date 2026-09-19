@@ -5,11 +5,16 @@
 1. Начинает со страницы тома (по умолчанию 5 том, откуда идёт чистый telegra.ph без Ranobelib)
 2. Собирает все ссылки "Глава N" на странице тома
 3. Идёт по ссылке "Следующий том" и повторяет, пока тома не закончатся
-4. После последней главы, найденной через тома (например, 1840), тома заканчиваются,
-   но у самих глав в конце текста есть ссылка "Следующая глава" — скрипт идёт по этим
-   ссылкам напрямую, пока они не закончатся
-5. Каждую главу скачивает через официальный API Telegraph (api.telegra.ph/getPage)
-6. Сохраняет каждую главу в отдельный .txt файл в папке chapters/
+4. Все главы, найденные через тома, скачивает параллельно (несколько потоков) —
+   их url заранее известны, поэтому порядок скачивания не важен
+5. После последней главы, найденной через тома (например, 1840), тома заканчиваются,
+   но у самих глав в конце текста есть ссылка "Следующая глава". Такие главы скачивает
+   по одной, идя по этой ссылке: url следующей главы становится известен только со
+   страницы предыдущей, поэтому этот шаг принципиально последовательный и его нельзя
+   распараллелить — но каждая страница запрашивается только один раз (сразу и текст
+   сохраняется, и ищется ссылка на следующую), а не дважды, как раньше
+6. Каждую главу скачивает через официальный API Telegraph (api.telegra.ph/getPage)
+7. Сохраняет каждую главу в отдельный .txt файл в папке chapters/
 
 Установка зависимостей:
     pip install requests beautifulsoup4
@@ -19,23 +24,37 @@
 """
 
 import re
-import time
 import json
+import time
+import threading
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.parse import urlparse
 
 START_VOLUME_URL = "https://telegra.ph/5-tom-989-1060-04-29"
 OUTPUT_DIR = Path("chapters")
-DELAY_BETWEEN_REQUESTS = 0.5  # секунды, чтобы не спамить API
+MAX_WORKERS = 8  # потоков для скачивания уже известных глав (из томов)
+VOLUME_DELAY = 0.5  # секунды между чтением страниц томов (их всего десяток, не критично)
 
 CHAPTER_LINK_RE = re.compile(r"Глава\s+(\d+)")
 NEXT_VOLUME_RE = re.compile(r"Следующий\s+том", re.IGNORECASE)
 NEXT_CHAPTER_LINK_TEXT_RE = re.compile(r"след", re.IGNORECASE)
 
+_thread_local = threading.local()
+
+
+def get_session() -> requests.Session:
+    """Session на поток: переиспользует TCP/TLS-соединение вместо того, чтобы
+    устанавливать его заново на каждый запрос — для длинной последовательной
+    цепочки "Следующая глава" это заметно быстрее обычных requests.get()."""
+    if not hasattr(_thread_local, "session"):
+        _thread_local.session = requests.Session()
+    return _thread_local.session
+
 
 def get_html(url: str) -> str:
-    r = requests.get(url, timeout=20)
+    r = get_session().get(url, timeout=20)
     r.raise_for_status()
     return r.text
 
@@ -90,7 +109,7 @@ def fetch_chapter_page(chapter_url: str) -> dict:
     """Возвращает result из Telegraph API (getPage) для главы: title, content и т.д."""
     path = telegraph_path_from_url(chapter_url)
     api_url = f"https://api.telegra.ph/getPage/{path}?return_content=true"
-    r = requests.get(api_url, timeout=20)
+    r = get_session().get(api_url, timeout=20)
     r.raise_for_status()
     data = r.json()
     if not data.get("ok"):
@@ -141,22 +160,66 @@ def find_next_chapter_url(content):
     return None
 
 
-def extend_chapters_via_next_links(all_chapters: dict):
-    """Продолжает all_chapters за пределы последнего тома, идя по ссылкам
-    "Следующая глава" внутри самих глав, пока такая ссылка находится."""
+def save_chapter(num: int, title: str, text: str):
+    out_path = OUTPUT_DIR / f"{num:05d}.txt"
+    out_path.write_text(f"{title}\n\n{text}", encoding="utf-8")
+    print(f"  Глава {num}: сохранено ({len(text)} символов)")
+
+
+def download_known_chapters(all_chapters: dict, max_workers: int = MAX_WORKERS):
+    """Скачивает уже известные (из томов) главы параллельно в несколько потоков —
+    их url заранее известны, порядок скачивания не важен."""
+    todo = [
+        (num, url)
+        for num, url in all_chapters.items()
+        if not (OUTPUT_DIR / f"{num:05d}.txt").exists()
+    ]
+    if not todo:
+        print("  Все известные главы уже скачаны.")
+        return
+
+    print(f"  Нужно скачать {len(todo)} глав(ы), потоков: {max_workers}")
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(download_chapter_text, url): num for num, url in todo}
+        for future in as_completed(futures):
+            num = futures[future]
+            try:
+                title, text = future.result()
+            except Exception as e:
+                print(f"  Глава {num}: ОШИБКА ({e}), пропускаю")
+                continue
+            save_chapter(num, title, text)
+
+
+def follow_and_download_next_links(all_chapters: dict):
+    """Продолжает за пределы последнего тома, идя по ссылке "Следующая глава"
+    внутри самих глав, и сразу сохраняет каждую главу.
+
+    Url следующей главы узнаётся только со страницы текущей, поэтому это
+    принципиально последовательный процесс (его нельзя распараллелить, не зная
+    заранее url'ы) — но каждая страница запрашивается один раз, а не дважды:
+    из того же ответа API берётся и текст для сохранения, и ссылка на следующую.
+    """
     if not all_chapters:
         return
 
     num = max(all_chapters)
     url = all_chapters[num]
     seen_urls = {url}
+    found = 0
 
     while True:
         try:
             result = fetch_chapter_page(url)
         except Exception as e:
-            print(f"  Глава {num}: не удалось прочитать для поиска следующей ссылки ({e})")
+            print(f"  Глава {num}: не удалось прочитать ({e})")
             break
+
+        out_path = OUTPUT_DIR / f"{num:05d}.txt"
+        if not out_path.exists():
+            title = result.get("title", telegraph_path_from_url(url))
+            text = node_to_text(result.get("content", [])).strip()
+            save_chapter(num, title, text)
 
         next_url = find_next_chapter_url(result.get("content", []))
         if not next_url or next_url in seen_urls:
@@ -167,9 +230,11 @@ def extend_chapters_via_next_links(all_chapters: dict):
         if num in all_chapters:
             break
         all_chapters[num] = next_url
-        print(f"    Найдена глава {num} по ссылке «Следующая глава»")
+        found += 1
         url = next_url
-        time.sleep(DELAY_BETWEEN_REQUESTS)
+
+    if found:
+        print(f"  Найдено и скачано ещё {found} глав(ы) по ссылке «Следующая глава»")
 
 
 def build_index():
@@ -214,28 +279,15 @@ def main():
                 all_chapters[num] = url
             print(f"    Найдено {len(chapters)} глав. Следующий том: {next_volume_url}")
             volume_url = next_volume_url
-            time.sleep(DELAY_BETWEEN_REQUESTS)
+            time.sleep(VOLUME_DELAY)
 
-        print("\nИщу главы после последнего тома по ссылкам «Следующая глава»...")
-        extend_chapters_via_next_links(all_chapters)
+        print(f"\nНайдено глав по томам: {len(all_chapters)}")
 
-        print(f"\nВсего найдено глав: {len(all_chapters)}")
+        print("\nСкачиваю главы из томов (параллельно)...")
+        download_known_chapters(all_chapters)
 
-        print("\nСкачиваю главы...")
-        for num in sorted(all_chapters):
-            out_path = OUTPUT_DIR / f"{num:05d}.txt"
-            if out_path.exists():
-                continue  # уже скачано, можно перезапускать скрипт после обрыва
-            url = all_chapters[num]
-            try:
-                title, text = download_chapter_text(url)
-            except Exception as e:
-                print(f"  Глава {num}: ОШИБКА ({e}), пропускаю")
-                continue
-
-            out_path.write_text(f"{title}\n\n{text}", encoding="utf-8")
-            print(f"  Глава {num}: сохранено ({len(text)} символов)")
-            time.sleep(DELAY_BETWEEN_REQUESTS)
+        print("\nИщу и скачиваю главы после последнего тома по ссылке «Следующая глава»...")
+        follow_and_download_next_links(all_chapters)
 
         print("\nГотово. Файлы лежат в папке chapters/")
     finally:
