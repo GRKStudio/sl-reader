@@ -43,6 +43,8 @@ OUTPUT_DIR = Path("chapters")
 PROGRESS_FILE = OUTPUT_DIR / "chain_progress.json"
 MAX_WORKERS = 8  # потоков для скачивания уже известных глав (из томов)
 VOLUME_DELAY = 0.5  # секунды между чтением страниц томов (их всего десяток, не критично)
+FETCH_RETRIES = 4  # попыток на один запрос перед тем, как считать главу недоступной
+FETCH_RETRY_BACKOFF = 2  # секунды, растёт линейно: 2, 4, 6...
 
 # Главы после последнего тома известны только по цепочке "Следующая глава",
 # и это последовательный процесс. Чтобы не идти по одной длинной цепочке от
@@ -123,15 +125,29 @@ def node_to_text(node) -> str:
 
 
 def fetch_chapter_page(chapter_url: str) -> dict:
-    """Возвращает result из Telegraph API (getPage) для главы: title, content и т.д."""
+    """Возвращает result из Telegraph API (getPage) для главы: title, content и т.д.
+
+    Повторяет запрос при сетевых сбоях (таймаут, обрыв, временная ошибка API) —
+    одна случайная заминка не должна обрывать всю цепочку "Следующая глава" на
+    сотни глав вперёд: раньше любая ошибка здесь сразу останавливала цепочку
+    без единой повторной попытки.
+    """
     path = telegraph_path_from_url(chapter_url)
     api_url = f"https://api.telegra.ph/getPage/{path}?return_content=true"
-    r = get_session().get(api_url, timeout=20)
-    r.raise_for_status()
-    data = r.json()
-    if not data.get("ok"):
-        raise RuntimeError(f"Telegraph API error for {chapter_url}: {data}")
-    return data["result"]
+    last_error = None
+    for attempt in range(FETCH_RETRIES):
+        try:
+            r = get_session().get(api_url, timeout=20)
+            r.raise_for_status()
+            data = r.json()
+            if not data.get("ok"):
+                raise RuntimeError(f"Telegraph API error for {chapter_url}: {data}")
+            return data["result"]
+        except Exception as e:
+            last_error = e
+            if attempt < FETCH_RETRIES - 1:
+                time.sleep(FETCH_RETRY_BACKOFF * (attempt + 1))
+    raise last_error
 
 
 def download_chapter_text(chapter_url: str) -> tuple[str, str]:
@@ -256,7 +272,7 @@ def run_chain_segment(anchor_num: int, anchor_url: str, stop_num, progress: dict
     if saved and saved.get("last_num", anchor_num) >= anchor_num:
         num, url = saved["last_num"], saved["last_url"]
         if stop_num is not None and num >= stop_num:
-            return num, 0  # этот отрезок уже был пройден целиком в прошлый раз
+            return num, 0, True  # этот отрезок уже был пройден целиком в прошлый раз
         print(f"  [{anchor_num}] продолжаю с сохранённой позиции: глава {num}")
     else:
         num, url = anchor_num, anchor_url
@@ -269,8 +285,12 @@ def run_chain_segment(anchor_num: int, anchor_url: str, stop_num, progress: dict
         try:
             result = fetch_chapter_page(url)
         except Exception as e:
-            print(f"  [{anchor_num}] глава {num}: не удалось прочитать ({e})")
-            break
+            # Это НЕ конец истории, а сбой (сеть/таймаут/API) — после всех
+            # повторных попыток в fetch_chapter_page. Если молча остановиться
+            # здесь, как раньше, цепочка оборвётся навсегда и дыра в сотни
+            # глав останется незамеченной, поэтому ok=False и явное предупреждение.
+            print(f"  [{anchor_num}] ⚠️ ЦЕПОЧКА ОБОРВАНА на главе {num}: {e}")
+            return (last_processed_num if last_processed_num is not None else num), found, False
 
         out_path = OUTPUT_DIR / f"{num:05d}.txt"
         if not out_path.exists():
@@ -285,7 +305,7 @@ def run_chain_segment(anchor_num: int, anchor_url: str, stop_num, progress: dict
 
         next_url = find_next_chapter_url(result.get("content", []))
         if not next_url or next_url in seen_urls:
-            break
+            break  # конец истории (или зацикливание ссылок) — нормальное завершение
         seen_urls.add(next_url)
 
         num += 1
@@ -294,7 +314,7 @@ def run_chain_segment(anchor_num: int, anchor_url: str, stop_num, progress: dict
         found += 1
         url = next_url
 
-    return (last_processed_num if last_processed_num is not None else num), found
+    return (last_processed_num if last_processed_num is not None else num), found, True
 
 
 def run_chain_segments(all_chapters: dict):
@@ -307,6 +327,7 @@ def run_chain_segments(all_chapters: dict):
 
     progress = load_progress()
     progress_lock = threading.Lock()
+    failed_anchors = []
 
     print(f"  Запускаю {len(segments)} параллельных цепочек «Следующая глава»...")
     with ThreadPoolExecutor(max_workers=len(segments)) as executor:
@@ -317,11 +338,20 @@ def run_chain_segments(all_chapters: dict):
         for future in as_completed(futures):
             anchor_num = futures[future]
             try:
-                last_num, found = future.result()
+                last_num, found, ok = future.result()
             except Exception as e:
                 print(f"  [{anchor_num}] цепочка прервалась с ошибкой: {e}")
+                failed_anchors.append(anchor_num)
                 continue
+            if not ok:
+                failed_anchors.append(anchor_num)
             print(f"  [{anchor_num}] цепочка дошла до главы {last_num} (+{found} новых)")
+
+    if failed_anchors:
+        print(
+            f"  ⚠️  Цепочки {failed_anchors} оборвались с ошибкой, не дойдя до конца. "
+            f"Запустите скрипт ещё раз — они продолжат с сохранённого места (chain_progress.json)."
+        )
 
 
 def build_index():
@@ -346,6 +376,36 @@ def build_index():
         json.dumps(entries, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     print(f"Индекс глав обновлён: {index_path} ({len(entries)} глав)")
+
+
+def check_for_gaps():
+    """Проверяет chapters/*.txt на пропуски в нумерации и явно их показывает.
+
+    Раньше цепочка "Следующая глава" могла молча оборваться на сетевой ошибке
+    (см. run_chain_segment) и оставить дыру в сотни глав, которую было видно
+    только вручную в читалке. Эта проверка запускается после каждого прогона
+    и сразу печатает, каких именно глав не хватает.
+    """
+    nums = sorted(int(p.stem) for p in OUTPUT_DIR.glob("*.txt") if p.stem.isdigit())
+    if not nums:
+        return
+
+    missing_ranges = []
+    for prev, cur in zip(nums, nums[1:]):
+        if cur - prev > 1:
+            missing_ranges.append((prev + 1, cur - 1))
+
+    if not missing_ranges:
+        print(f"Проверка пропусков: главы {nums[0]}-{nums[-1]} идут подряд, пропусков нет.")
+        return
+
+    print("\n⚠️  ВНИМАНИЕ: в нумерации глав есть пропуски:")
+    for start, end in missing_ranges:
+        if start == end:
+            print(f"   - глава {start} отсутствует")
+        else:
+            print(f"   - главы {start}-{end} отсутствуют ({end - start + 1} шт.)")
+    print("   Запустите скрипт ещё раз: цепочки продолжат с сохранённой позиции (chain_progress.json).")
 
 
 def main():
@@ -381,6 +441,7 @@ def main():
         # индекс пересобираем всегда, даже если скрипт прервали (Ctrl+C, обрыв
         # сети) — читалка должна видеть все главы, что реально скачаны на диск
         build_index()
+        check_for_gaps()
 
 
 if __name__ == "__main__":
