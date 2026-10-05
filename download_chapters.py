@@ -53,6 +53,7 @@ FETCH_RETRY_BACKOFF = 2  # секунды, растёт линейно: 2, 4, 6.
 # Ключ — номер главы, значение — её url.
 CHAIN_CHECKPOINTS = {
     1989: "https://telegra.ph/Glava-1989-Dom-milyj-dom-11-21",  # в 1988 текст "Следующая глава" не был гиперссылкой
+    2012: "https://telegra.ph/Glava-2012-Namyok-na-strah-12-02",  # та же проблема повторяется у нескольких глав подряд вплоть до 2012
     2250: "https://telegra.ph/Glava-2250-Plamya-nadezhdy-04-03",
     3000: "https://telegra.ph/Glava-3000-Vospominaniya-zabveniya-05-25",
 }
@@ -60,6 +61,7 @@ CHAIN_CHECKPOINTS = {
 CHAPTER_LINK_RE = re.compile(r"Глава\s+(\d+)")
 NEXT_VOLUME_RE = re.compile(r"Следующий\s+том", re.IGNORECASE)
 NEXT_CHAPTER_LINK_TEXT_RE = re.compile(r"след", re.IGNORECASE)
+PREV_CHAPTER_LINK_TEXT_RE = re.compile(r"пред", re.IGNORECASE)
 
 _thread_local = threading.local()
 
@@ -190,6 +192,19 @@ def find_next_chapter_url(content):
     """
     for text, href in find_links_in_content(content):
         if NEXT_CHAPTER_LINK_TEXT_RE.search(text):
+            return href
+    return None
+
+
+def find_prev_chapter_url(content):
+    """Ищет в тексте главы ссылку "Предыдущая глава" (зеркало find_next_chapter_url).
+
+    Нужна для обхода дыр НАЗАД: если у нескольких глав подряд сломана ссылка
+    "Следующая глава" (текст есть, а гиперссылки нет), но "Предыдущая глава"
+    у них рабочая, можно пройти дыру с другого конца.
+    """
+    for text, href in find_links_in_content(content):
+        if PREV_CHAPTER_LINK_TEXT_RE.search(text):
             return href
     return None
 
@@ -330,6 +345,45 @@ def run_chain_segment(anchor_num: int, anchor_url: str, stop_num, progress: dict
     return (last_processed_num if last_processed_num is not None else num), found, True
 
 
+def fill_gap_backward(end_num: int, end_url: str, lower_bound_num: int) -> tuple[int, int]:
+    """Идёт НАЗАД по ссылке "Предыдущая глава", начиная с end_num, и сохраняет
+    каждую главу, пока не дойдёт до lower_bound_num или пока такая ссылка не
+    кончится. Используется, когда вперёд дыру закрыть не вышло: у нескольких
+    глав подряд может быть сломана именно ссылка "Следующая глава" (текст
+    есть, а гиперссылки нет), а "Предыдущая глава" у них рабочая — тогда дыру
+    получается закрыть с другого конца.
+
+    Возвращает (до какого номера дошли, сколько новых глав сохранили). Если
+    результат <= lower_bound_num — дыра закрыта полностью.
+    """
+    num, url = end_num, end_url
+    seen_urls = {url}
+    filled = 0
+
+    while num > lower_bound_num:
+        try:
+            result = fetch_chapter_page(url)
+        except Exception as e:
+            print(f"  [gap-fill] глава {num}: не удалось прочитать назад ({e})")
+            break
+
+        out_path = OUTPUT_DIR / f"{num:05d}.txt"
+        if not out_path.exists():
+            title = result.get("title", telegraph_path_from_url(url))
+            text = node_to_text(result.get("content", [])).strip()
+            save_chapter(num, title, text)
+            filled += 1
+
+        prev_url = find_prev_chapter_url(result.get("content", []))
+        if not prev_url or prev_url in seen_urls:
+            break
+        seen_urls.add(prev_url)
+        num -= 1
+        url = prev_url
+
+    return num, filled
+
+
 def run_chain_segments(all_chapters: dict):
     """Запускает все отрезки цепочки "Следующая глава" параллельно, каждый в
     своём потоке — они независимы (используют разные url), поэтому в отличие
@@ -338,33 +392,44 @@ def run_chain_segments(all_chapters: dict):
     if not segments:
         return
 
+    anchor_url_by_num = {num: url for num, url, _ in segments}
     progress = load_progress()
     progress_lock = threading.Lock()
-    failed_anchors = []
+    failed = []  # (anchor_num, stop_num, last_num) — отрезки, не дошедшие до своей границы
 
     print(f"  Запускаю {len(segments)} параллельных цепочек «Следующая глава»...")
     with ThreadPoolExecutor(max_workers=len(segments)) as executor:
         futures = {
-            executor.submit(run_chain_segment, num, url, stop_num, progress, progress_lock): num
+            executor.submit(run_chain_segment, num, url, stop_num, progress, progress_lock): (num, stop_num)
             for num, url, stop_num in segments
         }
         for future in as_completed(futures):
-            anchor_num = futures[future]
+            anchor_num, stop_num = futures[future]
             try:
                 last_num, found, ok = future.result()
             except Exception as e:
                 print(f"  [{anchor_num}] цепочка прервалась с ошибкой: {e}")
-                failed_anchors.append(anchor_num)
                 continue
-            if not ok:
-                failed_anchors.append(anchor_num)
+            if not ok and stop_num is not None:
+                failed.append((anchor_num, stop_num, last_num))
             print(f"  [{anchor_num}] цепочка дошла до главы {last_num} (+{found} новых)")
 
-    if failed_anchors:
+    for anchor_num, stop_num, last_num in failed:
+        next_url = anchor_url_by_num.get(stop_num)
+        if next_url is None:
+            continue
         print(
-            f"  ⚠️  Цепочки {failed_anchors} оборвались с ошибкой, не дойдя до конца. "
-            f"Запустите скрипт ещё раз — они продолжат с сохранённого места (chain_progress.json)."
+            f"  [{anchor_num}] пробую закрыть дыру {last_num + 1}-{stop_num - 1} встречным "
+            f"обходом назад от главы {stop_num} (по ссылке «Предыдущая глава»)..."
         )
+        reached_num, filled = fill_gap_backward(stop_num, next_url, last_num)
+        if reached_num <= last_num:
+            print(f"  [{anchor_num}] дыра закрыта встречным обходом (+{filled} глав)")
+        else:
+            print(
+                f"  [{anchor_num}] ⚠️ дыра закрыта не полностью: главы {last_num + 1}-{reached_num} "
+                f"всё ещё могут отсутствовать — нужна ручная контрольная точка внутри этого диапазона"
+            )
 
 
 def build_index():
