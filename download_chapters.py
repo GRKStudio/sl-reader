@@ -52,6 +52,7 @@ FETCH_RETRY_BACKOFF = 2  # секунды, растёт линейно: 2, 4, 6.
 # более поздних глав — от каждой из них запустится своя параллельная цепочка.
 # Ключ — номер главы, значение — её url.
 CHAIN_CHECKPOINTS = {
+    1989: "https://telegra.ph/Glava-1989-Dom-milyj-dom-11-21",  # в 1988 текст "Следующая глава" не был гиперссылкой
     2250: "https://telegra.ph/Glava-2250-Plamya-nadezhdy-04-03",
     3000: "https://telegra.ph/Glava-3000-Vospominaniya-zabveniya-05-25",
 }
@@ -305,7 +306,19 @@ def run_chain_segment(anchor_num: int, anchor_url: str, stop_num, progress: dict
 
         next_url = find_next_chapter_url(result.get("content", []))
         if not next_url or next_url in seen_urls:
-            break  # конец истории (или зацикливание ссылок) — нормальное завершение
+            if stop_num is None:
+                break  # это последний отрезок (без границы) — настоящий конец истории
+            # Отрезок не дошёл до своей границы (stop_num), хотя должен был.
+            # Почти всегда это не конец истории, а то, что текст "Следующая
+            # глава" на этой странице не гиперссылка, а просто текст (так
+            # было с главой 1988) — наш парсер ищет именно <a href=...>.
+            print(
+                f"  [{anchor_num}] ⚠️ ЦЕПОЧКА ОБОРВАНА на главе {num}: ссылка «Следующая "
+                f"глава» не найдена, а граница ({stop_num}) ещё не достигнута. Скорее всего "
+                f"ссылка на этой странице не гиперссылка — добавьте url главы {num + 1} "
+                f"вручную в CHAIN_CHECKPOINTS."
+            )
+            return num, found, False
         seen_urls.add(next_url)
 
         num += 1
